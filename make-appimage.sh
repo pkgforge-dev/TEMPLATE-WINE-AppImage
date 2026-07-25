@@ -57,7 +57,7 @@ WINEPREFIX_SUBDIR=".wine"
 # wine and works completely standalone if no shared copy is found. Set to
 # 1 to default this ON for your app; users can always override at runtime
 # via the USE_SHARED_WINE_APPIMAGE env var regardless of this default.
-USE_SHARED_WINE_APPIMAGE="0"
+USE_SHARED_WINE_APPIMAGE="1"
 
 # Only for patching desktop file
 GENERIC_NAME="Archiving Tool" # example: Audio player
@@ -216,7 +216,7 @@ sed -i "s|^MimeType=.*|MimeType=${MIMETYPES_NAME}|" "${APPNAME}.desktop"
 # has so far, and USE_SHARED_WINE_APPIMAGE (set separately, see above)
 # only PREFERS the shared copy at runtime when both are available,
 # falling back to the bundled copy transparently if not found.
-REQUIRE_SHARED_WINE_APPIMAGE="0"
+REQUIRE_SHARED_WINE_APPIMAGE="1"
 
 # anylinux.so gets patchelf'd onto our BUNDLED libc.so.6 later, inside
 # the wine-specific block below — that patched libc only exists when

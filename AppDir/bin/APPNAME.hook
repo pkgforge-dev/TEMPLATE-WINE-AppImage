@@ -93,19 +93,23 @@ export EGL_LOG_LEVEL="${EGL_LOG_LEVEL:-"fatal"}"
 
 [ -d "$_APP_HOME" ] || mkdir -p "$_APP_HOME" || exit 1
 
+# Sync build-time payload from AppDir/share/$APPNAME → $_APP_HOME when the
+# AppImage version changes.
+#
+# Merge, do not wipe: overwrite/add files present in the new payload, leave
+# destination-only paths alone (portable configs, playlists, user components
+# next to the exe). A previous wipe-on-upgrade removed those.
+#
+# Avoid `cp -urs -u`: -u skipped hard-copied binaries the destination
+# considered newer, so an older build could keep running after a version bump.
+# Drop broken symlinks from older symlink-based syncs, then force-copy.
 _app_synced_ver_file="$_APP_HOME/.synced-version"
 if [ -d "$_APP_REAL" ] && { [ ! -f "$_app_synced_ver_file" ] || [ "$(cat "$_app_synced_ver_file" 2>&3)" != "$_APP_VER" ]; }; then
 	if [ -n "$(ls -A "$_APP_REAL" 2>&3)" ]; then
-		# Only clean broken symlinks at depth 1 — never recurse into .wine
 		find -L "$_APP_HOME/" -maxdepth 1 -mindepth 1 -type l -delete >/dev/null 2>&3 || true
-		# First sync: hard copy so files survive AppImage unmount.
-		# Later version bumps: symlink (cp -urs) for space; broken links
-		# from a previous AppImage mount are cleaned above before re-sync.
-		if [ ! -f "$_app_synced_ver_file" ]; then
-			cp -r "$_APP_REAL/"* "$_APP_HOME" >/dev/null 2>&3 || true
-		else
-			cp -urs "$_APP_REAL/"* "$_APP_HOME" >/dev/null 2>&3 || true
-		fi
+		# -a preserves mode/times; no -u so payload files always refresh
+		cp -a "$_APP_REAL/." "$_APP_HOME/" >/dev/null 2>&3 || \
+		cp -rf "$_APP_REAL/"* "$_APP_HOME" >/dev/null 2>&3 || true
 	fi
 	echo "$_APP_VER" > "$_app_synced_ver_file" 2>&3 || true
 fi
@@ -477,15 +481,28 @@ if [ -n "$INSTALL_URL" ] && [ -n "$RUN_EXE" ]; then
 	_run_exe_unix="$(_app_winpath_to_unix "$RUN_EXE")"
 	_installed_ver_file="$_APP_HOME/.installed_version"
 	_need_install=0
+	_version_upgrade=0
 	# Case-insensitive check for exe on Linux filesystems
 	if [ ! -f "$_run_exe_unix" ] && ! _app_ci_exists "$_run_exe_unix"; then
 		_need_install=1
 	elif [ ! -f "$_installed_ver_file" ] || [ "$(cat "$_installed_ver_file" 2>&3)" != "$_APP_VER" ]; then
 		_need_install=1
+		_version_upgrade=1
 	fi
 
 	if [ "$_need_install" = 1 ]; then
-		echo "Installing $_APP_NAME..." 2>&3
+		if [ "$_version_upgrade" = 1 ]; then
+			echo "Upgrading $_APP_NAME to $_APP_VER..." 2>&3
+			# Drop cached installer when URL basename is unversioned so a
+			# version bump does not reinstall the previous download.
+			case "$INSTALL_URL" in
+				http://*|https://*)
+					rm -f "$CACHEDIR/$(basename "${INSTALL_URL%%\?*}")"
+					;;
+			esac
+		else
+			echo "Installing $_APP_NAME..." 2>&3
+		fi
 		# Only stamp version when the expected exe is actually present
 		if _app_install_payload "$INSTALL_URL"; then
 			if [ -f "$_run_exe_unix" ] || _app_ci_exists "$_run_exe_unix"; then
@@ -495,7 +512,7 @@ if [ -n "$INSTALL_URL" ] && [ -n "$RUN_EXE" ]; then
 			fi
 		fi
 	fi
-	unset _run_exe_unix _installed_ver_file _need_install
+	unset _run_exe_unix _installed_ver_file _need_install _version_upgrade
 fi
 
 # Translate existing host paths to Wine paths. Absolute paths use the default

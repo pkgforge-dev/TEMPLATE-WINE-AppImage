@@ -172,12 +172,56 @@ fi
 # ---------------------------------------------------------------------------
 WINEPREFIX_DEDUP="${WINEPREFIX_DEDUP:-WINEPREFIX_DEDUP_HERE}"
 
+# Run wineboot via nested wine-AppImage with a clean env.
+# Parent (consumer) AppImage exports APPDIR/LD_* that prevent wine's
+# anylinux.so from resolving (libc is patched --add-needed anylinux.so).
+# $1 = WINEPREFIX  $2 = WINEDLLOVERRIDES (optional)
+#
+# Uses wineserver -k (not -w): -w hangs when a previous wineboot left
+# orphan clients — seen as a second "creating prefix" dialog then freeze.
+_app_wine_boot() {
+	_wb_prefix="$1"
+	_wb_ov="${2:-$WINEDLLOVERRIDES}"
+	_wb_bin="${WINE_APPIMAGE_PATH:-$WINELOADER}"
+	_wb_env() {
+		env -i \
+			HOME="${HOME}" \
+			USER="${USER:-}" \
+			LOGNAME="${LOGNAME:-}" \
+			PATH="/usr/local/bin:/usr/bin:/bin" \
+			DISPLAY="${DISPLAY:-}" \
+			WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+			XAUTHORITY="${XAUTHORITY:-}" \
+			XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+			XDG_DATA_HOME="${DATADIR:-${HOME}/.local/share}" \
+			XDG_CONFIG_HOME="${CONFIGDIR:-${HOME}/.config}" \
+			XDG_CACHE_HOME="${WINE_HOST_XDG_CACHE_HOME:-${HOME}/.cache}" \
+			LANG="${LANG:-C.UTF-8}" \
+			WINEPREFIX="$_wb_prefix" \
+			WINEDLLOVERRIDES="$_wb_ov" \
+			WINEDEBUG="-all" \
+			DISABLE_AUTO_UPDATES=1 \
+			"$_wb_bin" "$@"
+	}
+	# Drop stale server for this prefix before init
+	_wb_env wineserver -k >/dev/null 2>&3 || true
+	_wb_env wineboot --init 2>&3 || {
+		_wb_env wineserver -k >/dev/null 2>&3 || true
+		unset _wb_prefix _wb_ov _wb_bin
+		return 1
+	}
+	_wb_env wineserver -k >/dev/null 2>&3 || true
+	unset _wb_prefix _wb_ov _wb_bin
+	return 0
+}
+
 _wineprefix_ensure_template() {
 	[ "$WINEPREFIX_DEDUP" = 1 ] || return 0
 
 	_tpl_root="$DATADIR/wine-appimage/.template-prefix"
 	_tpl_prefix="$_tpl_root/.wine"
 	_tpl_stamp="$_tpl_root/.wine-id"
+	_tpl_fail="$_tpl_root/.wine-id.failed"
 	_tpl_ready="$_tpl_prefix/drive_c/windows/system32"
 	# Rebuild when wine binary OR overrides change (mono on vs off)
 	_wine_id="${WINE_APPIMAGE_PATH:-$WINELOADER}|${WINEDLLOVERRIDES}"
@@ -185,8 +229,16 @@ _wineprefix_ensure_template() {
 	if [ -d "$_tpl_ready" ] \
 		&& [ -f "$_tpl_stamp" ] \
 		&& [ "$(cat "$_tpl_stamp" 2>/dev/null || true)" = "$_wine_id" ]; then
-		unset _tpl_root _tpl_prefix _tpl_stamp _tpl_ready _wine_id
+		unset _tpl_root _tpl_prefix _tpl_stamp _tpl_fail _tpl_ready _wine_id
 		return 0
+	fi
+
+	# wineboot failed for this wine+overrides already — do not retry every launch
+	# (failed attempts used to rm the tree and re-run wineboot on every start).
+	if [ -f "$_tpl_fail" ] \
+		&& [ "$(cat "$_tpl_fail" 2>/dev/null || true)" = "$_wine_id" ]; then
+		unset _tpl_root _tpl_prefix _tpl_stamp _tpl_fail _tpl_ready _wine_id
+		return 1
 	fi
 
 	rm -rf "$_tpl_root"
@@ -199,13 +251,11 @@ _wineprefix_ensure_template() {
 		*) _tpl_ov="${_tpl_ov};winemenubuilder.exe=d" ;;
 	esac
 
-	WINEPREFIX="$_tpl_prefix" \
-	WINEDLLOVERRIDES="$_tpl_ov" \
-	WINEDEBUG="-all" \
-	DISABLE_AUTO_UPDATES=1 \
-		"$WINELOADER" wineboot --init 2>&3 || true
-	WINEPREFIX="$_tpl_prefix" DISABLE_AUTO_UPDATES=1 \
-		"$WINELOADER" wineserver -w 2>&3 || true
+	# Nested wine-AppImage must not inherit the consumer AppImage environment.
+	# wine-AppImage loads anylinux.so via libc NEEDED + LD_LIBRARY_PATH from
+	# its own .env; parent LD_* / APPDIR from the consumer break that
+	# (foobar2000#14: "anylinux.so: cannot open shared object file").
+	_app_wine_boot "$_tpl_prefix" "$_tpl_ov" || true
 
 	# Keep static system trees + Wine Mono trees when present
 	_win="$_tpl_prefix/drive_c/windows"
@@ -236,13 +286,19 @@ _wineprefix_ensure_template() {
 	fi
 
 	if [ ! -d "$_tpl_ready" ]; then
-		echo "WARN: prefix template missing system32 — dedup skipped" >&2
-		rm -rf "$_tpl_root"
-		unset _tpl_root _tpl_prefix _tpl_stamp _tpl_ready _wine_id _tpl_ov _win _entry
+		echo "WARN: prefix template wineboot failed (no system32) — dedup skipped" >&2
+		echo "WARN: if you see 'anylinux.so: cannot open shared object file', the" >&2
+		echo "WARN: nested wine-AppImage could not load; app still runs without dedup" >&2
+		# Keep failure stamp so we do not re-run wineboot every launch
+		rm -rf "$_tpl_prefix"
+		mkdir -p "$_tpl_root"
+		printf '%s\n' "$_wine_id" > "$_tpl_fail"
+		unset _tpl_root _tpl_prefix _tpl_stamp _tpl_fail _tpl_ready _wine_id _tpl_ov _win _entry
 		return 1
 	fi
+	rm -f "$_tpl_fail"
 	printf '%s\n' "$_wine_id" > "$_tpl_stamp"
-	unset _tpl_root _tpl_prefix _tpl_stamp _tpl_ready _wine_id _tpl_ov _win _entry
+	unset _tpl_root _tpl_prefix _tpl_stamp _tpl_fail _tpl_ready _wine_id _tpl_ov _win _entry
 	return 0
 }
 
@@ -271,17 +327,29 @@ _wineprefix_dedup_symlink() {
 	unset _dedup_prefix _tpl_prefix _sub _src _dst
 }
 
-# 1) Template first (shared trees), 2) app prefix, 3) link
-_wineprefix_ensure_template
-
+# Prefix init order (avoids double "creating prefix" dialog + hang):
+# 1) App WINEPREFIX first (one wineboot)
+# 2) Shared template only when app prefix already existed (skip on fresh install)
+# 3) Dedup symlinks if template is ready
+# Under AppRun's set -e, template/dedup failures must not abort (|| true).
 _app_fresh_prefix=0
 if [ ! -f "$WINEPREFIX/system.reg" ]; then
-	DISABLE_AUTO_UPDATES=1 "$WINELOADER" wineboot --init 2>&3
-	DISABLE_AUTO_UPDATES=1 "$WINELOADER" wineserver -w 2>&3 || true
-	_app_fresh_prefix=1
+	_app_wine_boot "$WINEPREFIX" "$WINEDLLOVERRIDES" || true
+	if [ -f "$WINEPREFIX/system.reg" ]; then
+		_app_fresh_prefix=1
+	else
+		echo "ERROR: wineboot failed to create WINEPREFIX at $WINEPREFIX" >&2
+		echo "ERROR: Nested wine-AppImage could not run (often anylinux.so)." >&2
+		echo "ERROR: Try manually: DISABLE_AUTO_UPDATES=1 \"$WINELOADER\" wineboot --init" >&2
+		exit 1
+	fi
+else
+	# Only build/refresh shared template when this launch is not already
+	# running a full app wineboot (second dialog + wineserver hang on live).
+	_wineprefix_ensure_template || true
 fi
 
-_wineprefix_dedup_symlink "$WINEPREFIX"
+_wineprefix_dedup_symlink "$WINEPREFIX" || true
 
 # AppData redirect: symlink each profile's AppData to
 # $DATADIR/wine-appimage/data/$APPNAME/AppData so settings survive prefix
